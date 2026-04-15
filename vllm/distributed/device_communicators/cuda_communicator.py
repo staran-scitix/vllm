@@ -23,6 +23,9 @@ logger = init_logger(__name__)
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
+    _H100_8GPU_FLASHINFER_MAX_SIZE = int(3.5 * 1024 * 1024)
+    _H100_8GPU_PYNCCL_SYMM_MAX_SIZE = 80 * 1024 * 1024
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -94,6 +97,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.fi_ar_comm = FlashInferAllReduce(
                 group=self.cpu_group,
                 device=self.device,
+                max_size_override=4096 * 1024,
             )
 
         if use_custom_allreduce and self.world_size > 1:
@@ -177,11 +181,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
+    def _use_h100_8gpu_allreduce_profile(self) -> bool:
+        return (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(90)
+            and self.world_size == 8
+        )
+
+    def _select_h100_8gpu_allreduce_backend(self, input_: torch.Tensor) -> str | None:
+        if not self._use_h100_8gpu_allreduce_profile():
+            return None
+
+        input_size = input_.nbytes
+        if input_size < self._H100_8GPU_FLASHINFER_MAX_SIZE:
+            return "flashinfer"
+        if input_size < self._H100_8GPU_PYNCCL_SYMM_MAX_SIZE:
+            return "pynccl_symm"
+        return "pynccl"
+
     def all_reduce(self, input_):
+        preferred_backend = self._select_h100_8gpu_allreduce_backend(input_)
+        if preferred_backend == "pynccl_symm" and self.pynccl_comm is not None:
+            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
+            if out is not None:
+                return out
+
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
-        if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
-            self.pynccl_comm.world_size, input_
+        if (
+            preferred_backend is None
+            and self.pynccl_comm is not None
+            and should_nccl_symm_mem_allreduce(self.pynccl_comm.world_size, input_)
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
@@ -201,6 +231,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             fi_ar_comm is not None
             and not fi_ar_comm.disabled
+            and preferred_backend in (None, "flashinfer")
             and fi_ar_comm.should_use_fi_ar(input_)
         ):
             out = fi_ar_comm.all_reduce(input_)
@@ -208,7 +239,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return out
         ca_comm = self.ca_comm
         if (
-            ca_comm is not None
+            preferred_backend != "pynccl"
+            and ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
@@ -216,7 +248,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             return out
         symm_mem_comm = self.symm_mem_comm
-        if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
+        if (
+            preferred_backend != "pynccl"
+            and symm_mem_comm is not None
+            and symm_mem_comm.should_use_symm_mem(input_)
+        ):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
             return out
